@@ -29,6 +29,7 @@ import com.libremobileos.sidebar.room.DatabaseRepository
 import com.libremobileos.sidebar.room.SidebarAppsEntity
 import com.libremobileos.sidebar.ui.sidebar.SidebarSettingsActivity
 import com.libremobileos.sidebar.utils.Logger
+import com.libremobileos.sidebar.utils.BubbleHelper
 import com.libremobileos.sidebar.utils.contains
 import com.libremobileos.sidebar.utils.getBadgedIcon
 import com.libremobileos.sidebar.utils.getInfo
@@ -55,6 +56,13 @@ class ServiceViewModel(private val application: Application): AndroidViewModel(a
     val sidebarAppListFlow: StateFlow<List<AppInfo>>
         get() = _sidebarAppList.asStateFlow()
     private val _sidebarAppList = MutableStateFlow<List<AppInfo>>(emptyList())
+
+    val isBubbleSupported: Boolean
+        get() = BubbleHelper.isSupported()
+
+    fun launchAsBubble(packageName: String, activityName: String, userId: Int) {
+        BubbleHelper.launchAsBubble(packageName, activityName, userId)
+    }
 
     private val predictedAppList = MutableStateFlow<List<AppInfo>>(emptyList())
 
@@ -294,8 +302,7 @@ class ServiceViewModel(private val application: Application): AndroidViewModel(a
                             runCatching {
                                 add(entity.toAppInfo())
                             }.onFailure { e ->
-                                logger.w("initSidebarAppList: removing $entity: $e")
-                                repository.deleteSidebarApp(entity.packageName, entity.activityName, entity.userId)
+                                logger.w("initSidebarAppList: skipped $entity: $e")
                             }
                         }
                         // then the predicted apps
