@@ -5,9 +5,11 @@ import android.app.IActivityManager
 import android.app.Service
 import android.app.UserSwitchObserver
 import android.content.BroadcastReceiver
+import android.database.ContentObserver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.provider.Settings
 import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.graphics.PixelFormat
@@ -45,11 +47,22 @@ class SidebarService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     private var screenHeight = 0
     private val layoutParams = LayoutParams()
     private val handler = Handler()
+    private var autoHideRunnable: Runnable? = null
     private val sideLineView by lazy {
         val gestureManager = MGestureManager(this@SidebarService, GestureListener(this@SidebarService))
         View(this).apply {
             background = AppCompatResources.getDrawable(this@SidebarService, R.drawable.ic_line)
             setOnTouchListener { _, event ->
+            when (event.action) {
+                    android.view.MotionEvent.ACTION_DOWN -> {
+                        cancelAutoHide()
+                        restoreSliderOpacity()
+                    }
+                    android.view.MotionEvent.ACTION_UP,
+                    android.view.MotionEvent.ACTION_CANCEL -> {
+                        scheduleAutoHide()
+                    }
+                }
                 gestureManager.onTouchEvent(event)
                 true
             }
@@ -69,6 +82,18 @@ class SidebarService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     private var isGameSpaceActive = false
+    private val gameSpaceObserver = object : ContentObserver(handler) {
+        override fun onChange(selfChange: Boolean) {
+            val active = Settings.Secure.getIntForUser(
+                contentResolver, "ax_gaming_mode_active", 0, UserHandle.USER_CURRENT
+            ) == 1
+            if (isGameSpaceActive != active) {
+                logger.d("gameSpaceObserver: active=$active")
+                isGameSpaceActive = active
+                updateSidebarVisibility()
+            }
+        }
+    }
 
     private val isPortrait: Boolean
         get() = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
@@ -84,6 +109,7 @@ class SidebarService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         private const val DEFAULT_SIDELINE_HEIGHT = 200
         private const val OFFSET_PORTRAIT = 20
         private const val OFFSET_LANDSCAPE = 0
+        private const val AUTO_HIDE_ALPHA = 0.01f
 
         const val SLIDER_TRANSPARENCY = "slider_transparency"
         const val SLIDER_LENGTH = "slider_length"
@@ -98,8 +124,8 @@ class SidebarService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         const val SIDEBAR_TAP_TO_OPEN = "sidebar_tap_to_open"
         const val SIDEBAR_SWIPE_TO_OPEN = "sidebar_swipe_to_open"
         const val SIDEBAR_HIDE_ON_GAMESPACE = "sidebar_hide_on_gamespace"
-        const val ACTION_GAME_START = "io.chaldeaprjkt.gamespace.action.GAME_START"
-        const val ACTION_GAME_STOP = "io.chaldeaprjkt.gamespace.action.GAME_STOP"
+        const val SIDEBAR_AUTO_HIDE_ENABLED = "sidebar_auto_hide_enabled"
+        const val SIDEBAR_AUTO_HIDE_TIMEOUT = "sidebar_auto_hide_timeout"
 
         //是否展示侧边条
         const val SIDELINE = "sideline"
@@ -132,20 +158,17 @@ class SidebarService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         
         serviceStarted = true
         
-        intent?.action?.let { action ->
-            when (action) {
-                ACTION_GAME_START -> {
-                    logger.d("onStartCommand: GameSpace started")
-                    isGameSpaceActive = true
-                    updateSidebarVisibility()
-                }
-                ACTION_GAME_STOP -> {
-                    logger.d("onStartCommand: GameSpace stopped")
-                    isGameSpaceActive = false
-                    updateSidebarVisibility()
-                }
-            }
-        }
+        isGameSpaceActive = Settings.Secure.getIntForUser(
+            contentResolver, "ax_gaming_mode_active", 0, UserHandle.USER_CURRENT
+        ) == 1
+        logger.d("onStartCommand: isGameSpaceActive=$isGameSpaceActive")
+
+        contentResolver.registerContentObserver(
+            Settings.Secure.getUriFor("ax_gaming_mode_active"),
+            false,
+            gameSpaceObserver,
+            UserHandle.USER_ALL
+        )
 
         sidebarView = SidebarView(this@SidebarService, viewModel, object : SidebarView.Callback {
             override fun onRemove() {
@@ -161,6 +184,7 @@ class SidebarService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 if (shouldShowService && isShowingSideline && !(isGameSpaceActive && hideOnGameSpace)) {
                     sideLineView.animate().cancel()
                     animateShowSideline()
+                    scheduleAutoHide()
                 }
             }
         })
@@ -200,6 +224,7 @@ class SidebarService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     override fun onDestroy() {
         super.onDestroy()
         if (!serviceStarted) return
+        contentResolver.unregisterContentObserver(gameSpaceObserver)
         sharedPrefs.unregisterOnSharedPreferenceChangeListener(this)
         iActivityManager.unregisterUserSwitchObserver(userSwitchObserver)
         removeView(force = true)
@@ -249,6 +274,13 @@ class SidebarService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             }
             SIDEBAR_HIDE_ON_GAMESPACE -> {
                 updateSidebarVisibility()
+            }
+            SIDEBAR_AUTO_HIDE_ENABLED, SIDEBAR_AUTO_HIDE_TIMEOUT -> {
+                if (isShowingSideline) {
+                    cancelAutoHide()
+                    restoreSliderOpacity()
+                    scheduleAutoHide()
+                }
             }
         }
     }
@@ -378,6 +410,7 @@ class SidebarService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 windowManager.addView(sideLineView, layoutParams)
                 viewModel.registerCallbacks()
                 isShowingSideline = true
+                scheduleAutoHide()
             }.onFailure { e ->
                 logger.e("failed to add sideline view: ", e)
             }
@@ -428,6 +461,7 @@ class SidebarService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         if (!isShowingSideline && !force) return
 
         logger.d("removeView")
+        cancelAutoHide()
         viewModel.unregisterCallbacks()
 
         handler.post {
@@ -443,27 +477,18 @@ class SidebarService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     private fun updateSidebarVisibility() {
-        if (!sharedPrefs.getBoolean(SIDEBAR_HIDE_ON_GAMESPACE, false)) {
-            if (!isGameSpaceActive) {
-                val masterEnabled = sharedPrefs.getBoolean(SIDELINE, false)
-                val autoEnabled = sharedPrefs.getBoolean(SidebarMonitorService.KEY_AUTO_ENABLED_TEMP, false)
-                if (masterEnabled || autoEnabled) {
-                    showView()
-                }
-            }
-            return
-        }
+        val masterEnabled = sharedPrefs.getBoolean(SIDELINE, false)
+        val autoEnabled = sharedPrefs.getBoolean(SidebarMonitorService.KEY_AUTO_ENABLED_TEMP, false)
+        val shouldBeEnabled = masterEnabled || autoEnabled
 
-        if (isGameSpaceActive) {
-            logger.d("updateSidebarVisibility: GameSpace active, removing view")
-            removeView()
+        val hideOnGameSpace = sharedPrefs.getBoolean(SIDEBAR_HIDE_ON_GAMESPACE, false)
+        val shouldHide = isGameSpaceActive && hideOnGameSpace
+
+        logger.d("updateSidebarVisibility: shouldBeEnabled=$shouldBeEnabled shouldHide=$shouldHide")
+        if (shouldBeEnabled && !shouldHide) {
+            showView()
         } else {
-            logger.d("updateSidebarVisibility: GameSpace stopped, restoring view if needed")
-            val masterEnabled = sharedPrefs.getBoolean(SIDELINE, false)
-            val autoEnabled = sharedPrefs.getBoolean(SidebarMonitorService.KEY_AUTO_ENABLED_TEMP, false)
-            if (masterEnabled || autoEnabled) {
-                showView()
-            }
+            removeView()
         }
     }
 
@@ -475,6 +500,36 @@ class SidebarService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     private fun animateShowSideline() {
         logger.d("animateShowSideline")
         sideLineView.animate().translationX(0f).setDuration(300).start()
+    }
+
+    private fun scheduleAutoHide() {
+        if (!sharedPrefs.getBoolean(SIDEBAR_AUTO_HIDE_ENABLED, false)) return
+        cancelAutoHide()
+        val timeoutSec = sharedPrefs.getInt(SIDEBAR_AUTO_HIDE_TIMEOUT, 5)
+        val runnable = Runnable {
+            if (isShowingSideline) {
+                logger.d("autoHide: fading slider to $AUTO_HIDE_ALPHA")
+                sideLineView.animate()
+                    .alpha(AUTO_HIDE_ALPHA)
+                    .setDuration(400)
+                    .start()
+            }
+        }
+        autoHideRunnable = runnable
+        handler.postDelayed(runnable, timeoutSec * 1000L)
+    }
+
+    private fun cancelAutoHide() {
+        autoHideRunnable?.let { handler.removeCallbacks(it) }
+        autoHideRunnable = null
+    }
+
+    private fun restoreSliderOpacity() {
+        val targetAlpha = sharedPrefs.getFloat(SLIDER_TRANSPARENCY, 1.0f)
+        sideLineView.animate()
+            .alpha(targetAlpha)
+            .setDuration(200)
+            .start()
     }
 
     private fun setIntSp(name: String, value: Int) {
